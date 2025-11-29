@@ -50,27 +50,43 @@ class NodeTranslator(Protocol):
     """Interface for translating n8n nodes into generated Python functions."""
 
     def generate_node_function(self, node: N8nNode) -> str:
-        ...
+        """Return Python code implementing the node."""
 
     def uses_llm(self, node: N8nNode) -> bool:
-        ...
+        """Return True if the node requires LLM support."""
 
 
 class SetNodeTranslator:
     """Translator for n8n Set nodes."""
 
     def generate_node_function(self, node: N8nNode) -> str:
-        params = json.dumps(node.parameters, indent=4)
-        code = f"""
-def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> WorkflowState:
-    '''Set node translated from n8n. Adds parameter values into state data.'''
+        values = node.parameters.get("values", {})
+        assignments = values.get("string", []) or []
+        writes: List[str] = []
+        for entry in assignments:
+            name = entry.get("name")
+            value = entry.get("value", "")
+            if name is None:
+                continue
+            writes.append(
+                f"    state.setdefault(\"context\", {{}})['{escape_string(str(name))}'] = '{escape_string(str(value))}'"
+            )
+        writes_code = "\n".join(writes) if writes else "    # No explicit set operations captured from n8n parameters"
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
+    '''Set node translated from n8n. Adds parameter values into state data and context.'''
     state.setdefault("data", [])
-    state.setdefault("context", {{}})
-    new_entry = {{"node": "{escape_string(node.name)}", "parameters": {params}}}
-    state["data"].append(new_entry)
-    state["last_node"] = "{escape_string(node.name)}"
+    state.setdefault("context", {})
+{writes}
+    state["data"].append({{"node": "{node_name}", "set": state.get("context", {{}})}})
+    state["last_node"] = "{node_name}"
     return state
 """
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            writes=writes_code,
+            node_name=escape_string(node.name),
+        )
         return textwrap.dedent(code)
 
     def uses_llm(self, node: N8nNode) -> bool:
@@ -83,26 +99,35 @@ class IfNodeTranslator:
     def generate_node_function(self, node: N8nNode) -> str:
         conditions = node.parameters.get("conditions", {})
         string_conditions = conditions.get("string", [])
-        cond_snippets = []
+        cond_snippets: List[str] = []
         for cond in string_conditions:
             value1 = escape_string(str(cond.get("value1", "")))
             value2 = escape_string(str(cond.get("value2", "")))
             operation = cond.get("operation", "equal")
+            left = f"state.get('context', {{}}).get('{value1}', '{value1}')"
             if operation == "equal":
-                snippet = f"str(state.get('context', {{}}).get('{value1}', '{value1}')) == '{value2}'"
+                snippet = f"str({left}) == '{value2}'"
+            elif operation == "notEqual":
+                snippet = f"str({left}) != '{value2}'"
             else:
                 snippet = "False"
             cond_snippets.append(snippet)
         condition_expr = " and ".join(cond_snippets) if cond_snippets else "False"
-        code = f"""
-def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> WorkflowState:
-    '''IF node translated from n8n. Evaluates simple string equality conditions.'''
-    state.setdefault("context", {{}})
-    result = bool({condition_expr})
-    state["context"]["if_{node.id}"] = result
-    state["last_node"] = "{escape_string(node.name)}"
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
+    '''IF node translated from n8n. Evaluates simple string conditions.'''
+    state.setdefault("context", {})
+    result = bool({condition})
+    state["context"]["if_{node_id}"] = result
+    state["last_node"] = "{node_name}"
     return state
 """
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            condition=condition_expr,
+            node_id=node.id,
+            node_name=escape_string(node.name),
+        )
         return textwrap.dedent(code)
 
     def uses_llm(self, node: N8nNode) -> bool:
@@ -118,15 +143,15 @@ class HttpRequestTranslator:
         url = escape_string(params.get("url", ""))
         headers = params.get("options", {}).get("headers", {}) or params.get("headerParameters", {})
         headers_literal = json.dumps(headers, indent=4)
-        body = params.get("body", {})
+        body = params.get("body", {}) or params.get("jsonParameters", {}) or {}
         body_literal = json.dumps(body, indent=4)
-        code = f"""
-def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> WorkflowState:
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
     '''HTTP Request node translated from n8n.'''
     import requests
 
     state.setdefault("data", [])
-    state.setdefault("context", {{}})
+    state.setdefault("context", {})
     try:
         response = requests.request(
             method="{method}",
@@ -138,12 +163,20 @@ def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> Wor
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
         payload = response.json() if "json" in content_type else response.text
-        state["data"].append({{"node": "{escape_string(node.name)}", "response": payload}})
+        state["data"].append({{"node": "{node_name}", "response": payload}})
     except Exception as exc:  # pragma: no cover - runtime safety
-        state["data"].append({{"node": "{escape_string(node.name)}", "error": str(exc)}})
-    state["last_node"] = "{escape_string(node.name)}"
+        state["data"].append({{"node": "{node_name}", "error": str(exc)}})
+    state["last_node"] = "{node_name}"
     return state
 """
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            method=method,
+            url=url,
+            headers_literal=headers_literal,
+            body_literal=body_literal,
+            node_name=escape_string(node.name),
+        )
         return textwrap.dedent(code)
 
     def uses_llm(self, node: N8nNode) -> bool:
@@ -156,18 +189,23 @@ class CodeNodeTranslator:
     def generate_node_function(self, node: N8nNode) -> str:
         function_code = node.parameters.get("functionCode", "")
         commented_code = "\n".join(f"    # {line}" for line in function_code.splitlines())
-        code = f"""
-def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> WorkflowState:
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
     '''Code node translated from n8n. Manual review may be required.'''
-    state.setdefault("context", {{}})
+    state.setdefault("context", {})
     state.setdefault("data", [])
     # Original n8n functionCode preserved for reference:
-{commented_code if commented_code else '    # (no code provided)'}
+{code_block}
     # You may execute custom logic here. For safety, this is left as a stub.
-    state["data"].append({{"node": "{escape_string(node.name)}", "note": "Code execution not implemented. Manual review required."}})
-    state["last_node"] = "{escape_string(node.name)}"
+    state["data"].append({{"node": "{node_name}", "note": "Code execution not implemented. Manual review required."}})
+    state["last_node"] = "{node_name}"
     return state
 """
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            code_block=commented_code if commented_code else "    # (no code provided)",
+            node_name=escape_string(node.name),
+        )
         return textwrap.dedent(code)
 
     def uses_llm(self, node: N8nNode) -> bool:
@@ -180,21 +218,51 @@ class OpenAiNodeTranslator:
     def generate_node_function(self, node: N8nNode) -> str:
         prompt = escape_string(node.parameters.get("prompt", ""))
         system_prompt = escape_string(node.parameters.get("systemMessage", ""))
-        code = f"""
-def {sanitize_identifier(node_function_name(node))}(state: WorkflowState) -> WorkflowState:
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
     '''OpenAI node translated from n8n using Responses API with gpt-5.'''
+    from langchain_core.runnables import RunnableLambda
+
     state.setdefault("data", [])
-    state.setdefault("context", {{}})
-    response_text = call_llm(prompt="{prompt}", system="{system_prompt}" or None)
-    state["data"].append({{"node": "{escape_string(node.name)}", "response": response_text}})
-    state["context"]["openai_{node.id}"] = response_text
-    state["last_node"] = "{escape_string(node.name)}"
+    state.setdefault("context", {})
+
+    llm_step = RunnableLambda(lambda user_prompt: call_llm(prompt=user_prompt, system="{system_prompt}" or None))
+    response_text = llm_step.invoke("{prompt}")
+    state["data"].append({{"node": "{node_name}", "response": response_text}})
+    state["context"]["openai_{node_id}"] = response_text
+    state["last_node"] = "{node_name}"
     return state
 """
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            system_prompt=system_prompt,
+            prompt=prompt,
+            node_name=escape_string(node.name),
+            node_id=node.id,
+        )
         return textwrap.dedent(code)
 
     def uses_llm(self, node: N8nNode) -> bool:
         return True
+
+
+class UnsupportedNodeTranslator:
+    """Fallback translator that raises NotImplementedError at runtime."""
+
+    def generate_node_function(self, node: N8nNode) -> str:
+        template = """
+def {func_name}(state: WorkflowState) -> WorkflowState:
+    '''Unsupported node type stub.'''
+    raise NotImplementedError("Node type {node_type} is not supported yet.")
+"""
+        code = template.format(
+            func_name=sanitize_identifier(node_function_name(node)),
+            node_type=escape_string(node.type),
+        )
+        return textwrap.dedent(code)
+
+    def uses_llm(self, node: N8nNode) -> bool:
+        return False
 
 
 NODE_TRANSLATORS: Dict[str, NodeTranslator] = {
@@ -205,8 +273,7 @@ NODE_TRANSLATORS: Dict[str, NodeTranslator] = {
     "n8n-nodes-base.openAi": OpenAiNodeTranslator(),
 }
 
-
-DEFAULT_TRANSLATOR = CodeNodeTranslator()
+DEFAULT_TRANSLATOR = UnsupportedNodeTranslator()
 
 
 def sanitize_identifier(name: str) -> str:
@@ -222,7 +289,7 @@ def sanitize_identifier(name: str) -> str:
 def escape_string(text: str) -> str:
     """Escape quotes for safe embedding in generated code."""
 
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+    return text.replace("\\", "\\\\").replace("\"", "\\\"")
 
 
 def node_function_name(node: N8nNode) -> str:
@@ -283,7 +350,6 @@ def load_workflow(path: str) -> N8nWorkflow:
         if incoming.get(node_id, 0) == 0 or "trigger" in node.type.lower() or "webhook" in node.type.lower():
             start_nodes.append(node_id)
     if not start_nodes:
-        # fall back to first node
         start_nodes = [next(iter(nodes.keys()))]
 
     return N8nWorkflow(nodes=nodes, edges=edges, start_nodes=start_nodes)
@@ -294,29 +360,46 @@ def generate_node_function(node: N8nNode) -> Tuple[str, bool]:
 
     translator = NODE_TRANSLATORS.get(node.type, DEFAULT_TRANSLATOR)
     if translator is DEFAULT_TRANSLATOR and node.type not in NODE_TRANSLATORS:
-        logger.warning("Unsupported node type '%s'. Generating stub Code node.", node.type)
+        logger.warning("Unsupported node type '%s'. Generating stub node.", node.type)
     code = translator.generate_node_function(node)
     return code, translator.uses_llm(node)
 
 
-def generate_routing_function(node_id: str, edges: List[N8nEdge]) -> str:
+def generate_routing_function(node: N8nNode, edges: List[N8nEdge]) -> str:
     """Generate a routing function for conditional edges from a node."""
 
-    mapping_lines = []
+    default_label = edges[0].condition_label or f"out_{edges[0].source_output_index}"
+    label_lines = []
     for edge in edges:
         label = edge.condition_label or f"out_{edge.source_output_index}"
-        mapping_lines.append(f"    if label == '{label}':\n        return '{edge.target_id}'")
-    mapping_body = "\n".join(mapping_lines)
-    code = f"""
-def route_from_{sanitize_identifier(node_id)}(state: WorkflowState) -> str:
-    '''Routing function for node {node_id}. Update the label as needed.'''
+        label_lines.append(f"    if label == '{label}':\n        return '{edge.target_id}'")
+    mapping_body = "\n".join(label_lines)
+    route_hint = f"state.get('context', {{}}).get('route_{node.id}')"
+    if "if" in node.type.lower():
+        route_hint = f"state.get('context', {{}}).get('if_{node.id}')"
+    template = """
+def {func_name}(state: WorkflowState) -> str:
+    '''Routing function for node {node_name}. Update the label as needed.'''
     label = state.get("context", {{}}).get("route_{node_id}")
     if label is None:
-        # Default to first available label
-        label = "{edges[0].condition_label or f'out_{edges[0].source_output_index}'}"
-    {mapping_body}
-    return '{edges[0].target_id}'
+        label = {route_hint}
+    if label is None:
+        label = "{default_label}"
+    if isinstance(label, bool):
+        label = "true" if label else "false"
+    label = str(label)
+{mapping_body}
+    return '{fallback_target}'
 """
+    code = template.format(
+        func_name=f"route_from_{sanitize_identifier(node.id)}",
+        node_name=node.name,
+        node_id=node.id,
+        route_hint=route_hint,
+        default_label=default_label,
+        mapping_body=mapping_body,
+        fallback_target=edges[-1].target_id,
+    )
     return textwrap.dedent(code)
 
 
@@ -324,81 +407,80 @@ def generate_python(workflow: N8nWorkflow) -> str:
     """Generate the Python script implementing the workflow using LangGraph."""
 
     lines: List[str] = []
-    lines.append("from __future__ import annotations")
-    lines.append("import argparse")
-    lines.append("import json")
-    lines.append("from typing import TypedDict, Any, Dict, List")
-    lines.append("from openai import OpenAI")
-    lines.append("from langgraph.graph import StateGraph")
-    lines.append("import os")
-    lines.append("")
-    lines.append("class WorkflowState(TypedDict, total=False):")
-    lines.append("    data: List[Dict[str, Any]]")
-    lines.append("    context: Dict[str, Any]")
-    lines.append("    last_node: str")
-    lines.append("")
-    lines.append("client = OpenAI()")
-    lines.append("")
-    lines.append("def call_llm(prompt: str, system: str | None = None) -> str:")
-    lines.append("    \"\"\"Call OpenAI Responses API with model gpt-5.\"\"\"")
-    lines.append("    messages = []")
-    lines.append("    if system:\n        messages.append({\"role\": \"system\", \"content\": system})")
-    lines.append("    messages.append({\"role\": \"user\", \"content\": prompt})")
-    lines.append("    response = client.responses.create(model=\"gpt-5\", input=messages)")
-    lines.append("    choice = response.output[0]")
-    lines.append("    return choice.content[0].text")
-    lines.append("")
+    append = lines.append
+    append("from __future__ import annotations")
+    append("import argparse")
+    append("import json")
+    append("from typing import TypedDict, Any, Dict, List")
+    append("from openai import OpenAI")
+    append("from langgraph.graph import StateGraph")
+    append("import os")
+    append("")
+    append("class WorkflowState(TypedDict, total=False):")
+    append("    data: List[Dict[str, Any]]")
+    append("    context: Dict[str, Any]")
+    append("    last_node: str")
+    append("")
+    append("client = OpenAI()")
+    append("")
+    append("def call_llm(prompt: str, system: str | None = None) -> str:")
+    append("    \"\"\"Call OpenAI Responses API with model gpt-5.\"\"\"")
+    append("    messages = []")
+    append("    if system:\n        messages.append({\"role\": \"system\", \"content\": system})")
+    append("    messages.append({\"role\": \"user\", \"content\": prompt})")
+    append("    response = client.responses.create(model=\"gpt-5\", input=messages)")
+    append("    choice = response.output[0]")
+    append("    return choice.content[0].text")
+    append("")
 
     sorted_nodes = sorted(workflow.nodes.values(), key=lambda n: n.name)
     for node in sorted_nodes:
-        func_code, uses_llm = generate_node_function(node)
-        lines.append(func_code)
+        func_code, _ = generate_node_function(node)
+        append(func_code)
 
-    # Edges grouping
     edges_by_source: Dict[str, List[N8nEdge]] = {}
     for edge in workflow.edges:
         edges_by_source.setdefault(edge.source_id, []).append(edge)
 
-    # Routing functions for conditional edges
     for source_id, edges in edges_by_source.items():
-        if len(edges) > 1:
-            lines.append(generate_routing_function(source_id, edges))
+        if len(edges) > 1 or any(edge.condition_label for edge in edges):
+            append(generate_routing_function(workflow.nodes.get(source_id, N8nNode(source_id, source_id, "", {}, {})), edges))
 
-    # build_graph definition
-    lines.append("def build_graph():")
-    lines.append("    graph = StateGraph(WorkflowState)")
+    append("def build_graph():")
+    append("    graph = StateGraph(WorkflowState)")
     for node in sorted_nodes:
-        lines.append(f"    graph.add_node('{node.id}', {sanitize_identifier(node_function_name(node))})")
+        append(f"    graph.add_node('{node.id}', {sanitize_identifier(node_function_name(node))})")
 
-    for start_id in workflow.start_nodes:
-        lines.append(f"    graph.set_entry_point('{start_id}')")
+    if workflow.start_nodes:
+        append(f"    graph.set_entry_point('{workflow.start_nodes[0]}')")
 
     for source_id, edges in edges_by_source.items():
-        if len(edges) == 1:
-            target = edges[0].target_id
-            lines.append(f"    graph.add_edge('{source_id}', '{target}')")
+        if len(edges) == 1 and not edges[0].condition_label:
+            append(f"    graph.add_edge('{source_id}', '{edges[0].target_id}')")
         else:
             label_map = {edge.condition_label or f"out_{edge.source_output_index}": edge.target_id for edge in edges}
-            lines.append(f"    graph.add_conditional_edges('{source_id}', route_from_{sanitize_identifier(source_id)}, {label_map})")
+            append(
+                f"    graph.add_conditional_edges('{source_id}', route_from_{sanitize_identifier(source_id)}, {label_map})"
+            )
 
-    lines.append("    return graph.compile()")
-    lines.append("")
-    lines.append("def run_workflow(initial_state: Dict[str, Any] | None = None) -> Dict[str, Any]:")
-    lines.append("    state = initial_state or {'data': [], 'context': {}}");
-    lines.append("    app = build_graph()")
-    lines.append("    result = app.invoke(state)")
-    lines.append("    return result")
-    lines.append("")
-    lines.append("def main():")
-    lines.append("    parser = argparse.ArgumentParser(description='Run generated LangGraph workflow.')")
-    lines.append("    parser.add_argument('--input-json', help='Initial state as JSON string', default=None)")
-    lines.append("    args = parser.parse_args()")
-    lines.append("    initial_state = json.loads(args.input_json) if args.input_json else None")
-    lines.append("    final_state = run_workflow(initial_state)")
-    lines.append("    print(json.dumps(final_state, indent=2))")
-    lines.append("")
-    lines.append("if __name__ == '__main__':")
-    lines.append("    main()")
+    append("    return graph.compile()")
+    append("")
+    append("def run_workflow(initial_state: Dict[str, Any] | None = None) -> Dict[str, Any]:")
+    append("    state = initial_state or {'data': [], 'context': {}}")
+    append("    app = build_graph()")
+    append("    result = app.invoke(state)")
+    append("    return result")
+    append("")
+    append("def main():")
+    append("    parser = argparse.ArgumentParser(description='Run generated LangGraph workflow.')")
+    append("    parser.add_argument('--input-json', help='Initial state as JSON string', default=None)")
+    append("    args = parser.parse_args()")
+    append("    initial_state = json.loads(args.input_json) if args.input_json else None")
+    append("    final_state = run_workflow(initial_state)")
+    append("    print(json.dumps(final_state, indent=2))")
+    append("")
+    append("if __name__ == '__main__':")
+    append("    main()")
 
     return "\n".join(lines)
 
