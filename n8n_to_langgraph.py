@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -12,6 +13,12 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
+
+OPENAI_AVAILABLE = importlib.util.find_spec("openai") is not None
+if OPENAI_AVAILABLE:
+    from openai import OpenAI
+else:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,105 @@ class GenerationOptions:
     enable_reflection: bool = False
     reflection_steps: int = 1
     enable_agent: bool = False
+    enable_llm_assist: bool = False
+    llm_assist_model: str = "gpt-5.1-codex-max"
+
+
+class LLMAssistant:
+    """LLM helper to fill translation gaps and enhance prompts during conversion."""
+
+    def __init__(self, model: str, enabled: bool = False):
+        self.model = model
+        self.enabled = enabled
+        if self.enabled and not OPENAI_AVAILABLE:
+            logger.warning("LLM assist requested but openai is not installed. Disabling assist.")
+            self.enabled = False
+        self.client = OpenAI() if self.enabled and OPENAI_AVAILABLE else None
+
+    def improve_prompts(self, prompt: str, system: str, node: N8nNode) -> Tuple[str, str]:
+        """Enhance user/system prompts for OpenAI nodes via an LLM."""
+
+        if not self.enabled or not prompt.strip():
+            return prompt, system
+
+        messages = [
+            {
+                "role": "system",
+                "content": "Rewrite prompts for clarity, safety, and context-awareness without changing intent.",
+            },
+            {
+                "role": "user",
+                "content": textwrap.dedent(
+                    f"""
+                    Node name: {node.name}
+                    Node type: {node.type}
+                    Current user prompt:\n{prompt}
+                    Current system prompt:\n{system or '(none)'}
+
+                    Return two sections labeled USER PROMPT and SYSTEM PROMPT with improved text.
+                    If the system prompt is empty, propose a concise system message that sets boundaries and role.
+                    """
+                ),
+            },
+        ]
+
+        try:
+            response = self.client.responses.create(model=self.model, input=messages)
+            content = response.output[0].content[0].text
+        except Exception as exc:  # pragma: no cover - network/external
+            logger.warning("LLM prompt improvement failed for node %s: %s", node.name, exc)
+            return prompt, system
+
+        improved_user = prompt
+        improved_system = system
+        if content:
+            user_match = re.search(r"USER PROMPT:\s*(.+?)\s*(SYSTEM PROMPT:|$)", content, re.DOTALL | re.IGNORECASE)
+            system_match = re.search(r"SYSTEM PROMPT:\s*(.+)$", content, re.DOTALL | re.IGNORECASE)
+            if user_match:
+                improved_user = user_match.group(1).strip()
+            if system_match:
+                improved_system = system_match.group(1).strip()
+        return improved_user or prompt, improved_system or system
+
+    def suggest_translation(self, node: N8nNode) -> Optional[str]:
+        """Attempt to synthesize a best-effort node function for unsupported nodes."""
+
+        if not self.enabled:
+            return None
+
+        func_name = sanitize_identifier(node_function_name(node))
+        messages = [
+            {
+                "role": "system",
+                "content": textwrap.dedent(
+                    """
+                    You generate safe Python functions for LangGraph workflows.
+                    - Signature: def {func_name}(state: WorkflowState) -> WorkflowState
+                    - Always preserve and update state['data'], state['context'], and state['last_node'].
+                    - If real execution is unclear, log intent into state['data'] and avoid side effects.
+                    - Use inline comments to note assumptions.
+                    - Never rely on external libraries beyond json/text processing unless the node type implies HTTP.
+                    """
+                ),
+            },
+            {
+                "role": "user",
+                "content": textwrap.dedent(
+                    f"""
+                    Produce a function body for node {node.name} ({node.type}).
+                    Parameters:\n{textwrap.indent(json.dumps(node.parameters, indent=2), '  ')}
+                    Full node payload:\n{textwrap.indent(json.dumps(node.raw, indent=2), '  ')}
+                    """
+                ),
+            },
+        ]
+
+        try:
+            response = self.client.responses.create(model=self.model, input=messages)
+            return response.output[0].content[0].text.strip()
+        except Exception as exc:  # pragma: no cover - network/external
+            logger.warning("LLM translation synthesis failed for node %s: %s", node.name, exc)
+            return None
 
 
 class NodeTranslator(Protocol):
@@ -225,12 +331,19 @@ def {func_name}(state: WorkflowState) -> WorkflowState:
 class OpenAiNodeTranslator:
     """Translator for n8n OpenAI nodes using Responses API."""
 
-    def __init__(self, options: GenerationOptions):
+    def __init__(self, options: GenerationOptions, assistant: Optional[LLMAssistant] = None):
         self.options = options
+        self.assistant = assistant
 
     def generate_node_function(self, node: N8nNode) -> str:
-        prompt = escape_string(node.parameters.get("prompt", ""))
-        system_prompt = escape_string(node.parameters.get("systemMessage", ""))
+        prompt = node.parameters.get("prompt", "")
+        system_prompt = node.parameters.get("systemMessage", "")
+
+        if self.assistant:
+            prompt, system_prompt = self.assistant.improve_prompts(prompt, system_prompt, node)
+
+        prompt_literal = escape_string(prompt)
+        system_prompt_literal = escape_string(system_prompt)
         template = """
 def {func_name}(state: WorkflowState) -> WorkflowState:
     '''OpenAI node translated from n8n using Responses API with configurable models and reflection.'''
@@ -260,8 +373,8 @@ def {func_name}(state: WorkflowState) -> WorkflowState:
 """
         code = template.format(
             func_name=sanitize_identifier(node_function_name(node)),
-            system_prompt=system_prompt,
-            prompt=prompt,
+            system_prompt=system_prompt_literal,
+            prompt=prompt_literal,
             node_name=escape_string(node.name),
             node_id=node.id,
         )
@@ -290,7 +403,7 @@ def {func_name}(state: WorkflowState) -> WorkflowState:
         return False
 
 
-def get_translators(options: GenerationOptions) -> Dict[str, NodeTranslator]:
+def get_translators(options: GenerationOptions, assistant: Optional[LLMAssistant] = None) -> Dict[str, NodeTranslator]:
     """Return node translators configured with generation options."""
 
     return {
@@ -298,7 +411,7 @@ def get_translators(options: GenerationOptions) -> Dict[str, NodeTranslator]:
         "n8n-nodes-base.if": IfNodeTranslator(),
         "n8n-nodes-base.httpRequest": HttpRequestTranslator(),
         "n8n-nodes-base.code": CodeNodeTranslator(),
-        "n8n-nodes-base.openAi": OpenAiNodeTranslator(options),
+        "n8n-nodes-base.openAi": OpenAiNodeTranslator(options, assistant=assistant),
     }
 
 
@@ -319,6 +432,17 @@ def escape_string(text: str) -> str:
     """Escape quotes for safe embedding in generated code."""
 
     return text.replace("\\", "\\\\").replace("\"", "\\\"")
+
+
+def clean_generated_code(code: str) -> str:
+    """Remove markdown fences and normalize indentation from LLM output."""
+
+    cleaned = code.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    return textwrap.dedent(cleaned).strip()
 
 
 def node_function_name(node: N8nNode) -> str:
@@ -384,13 +508,18 @@ def load_workflow(path: str) -> N8nWorkflow:
     return N8nWorkflow(nodes=nodes, edges=edges, start_nodes=start_nodes)
 
 
-def generate_node_function(node: N8nNode, options: GenerationOptions) -> Tuple[str, bool]:
+def generate_node_function(
+    node: N8nNode, options: GenerationOptions, assistant: Optional[LLMAssistant]
+) -> Tuple[str, bool]:
     """Generate Python code for a node function and return (code, uses_llm)."""
 
-    translators = get_translators(options)
+    translators = get_translators(options, assistant=assistant)
     translator = translators.get(node.type, DEFAULT_TRANSLATOR)
     if translator is DEFAULT_TRANSLATOR and node.type not in translators:
         logger.warning("Unsupported node type '%s'. Generating stub node.", node.type)
+        suggestion = assistant.suggest_translation(node) if assistant else None
+        if suggestion:
+            return clean_generated_code(suggestion), False
     code = translator.generate_node_function(node)
     return code, translator.uses_llm(node)
 
@@ -433,7 +562,9 @@ def {func_name}(state: WorkflowState) -> str:
     return textwrap.dedent(code)
 
 
-def generate_python(workflow: N8nWorkflow, options: GenerationOptions) -> str:
+def generate_python(
+    workflow: N8nWorkflow, options: GenerationOptions, assistant: Optional[LLMAssistant]
+) -> str:
     """Generate the Python script implementing the workflow using LangGraph."""
 
     lines: List[str] = []
@@ -498,7 +629,7 @@ def generate_python(workflow: N8nWorkflow, options: GenerationOptions) -> str:
 
     sorted_nodes = sorted(workflow.nodes.values(), key=lambda n: n.name)
     for node in sorted_nodes:
-        func_code, _ = generate_node_function(node, options)
+        func_code, _ = generate_node_function(node, options, assistant)
         append(func_code)
 
     edges_by_source: Dict[str, List[N8nEdge]] = {}
@@ -583,6 +714,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Use the lightweight agentic LLM helper in generated OpenAI nodes",
     )
+    parser.add_argument(
+        "--enable-llm-assist",
+        action="store_true",
+        help="Leverage an LLM during conversion to synthesize unsupported nodes and polish prompts",
+    )
+    parser.add_argument(
+        "--llm-assist-model",
+        default="gpt-5.1-codex-max",
+        help="Model used for LLM-assisted conversion",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args(argv)
 
@@ -606,6 +747,8 @@ def summarize(workflow: N8nWorkflow, output_path: str, options: GenerationOption
         print("Agentic LLM: enabled")
     if options.enable_reflection:
         print(f"Reflection steps: {max(1, options.reflection_steps)}")
+    if options.enable_llm_assist:
+        print(f"LLM-assisted conversion: enabled ({options.llm_assist_model})")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -631,10 +774,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         enable_reflection=args.enable_reflection,
         reflection_steps=args.reflection_steps,
         enable_agent=args.enable_agent,
+        enable_llm_assist=args.enable_llm_assist,
+        llm_assist_model=args.llm_assist_model,
     )
 
+    assistant = LLMAssistant(model=options.llm_assist_model, enabled=options.enable_llm_assist)
+
     try:
-        code = generate_python(workflow, options)
+        code = generate_python(workflow, options, assistant if assistant.enabled else None)
     except Exception as exc:
         logger.error("Failed to generate Python code: %s", exc)
         sys.exit(1)
