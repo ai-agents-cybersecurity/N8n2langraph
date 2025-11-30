@@ -46,6 +46,16 @@ class N8nWorkflow:
     start_nodes: List[str]
 
 
+@dataclass
+class GenerationOptions:
+    """Options that influence generated workflow behavior."""
+
+    llm_model: str = "gpt-5"
+    enable_reflection: bool = False
+    reflection_steps: int = 1
+    enable_agent: bool = False
+
+
 class NodeTranslator(Protocol):
     """Interface for translating n8n nodes into generated Python functions."""
 
@@ -215,19 +225,34 @@ def {func_name}(state: WorkflowState) -> WorkflowState:
 class OpenAiNodeTranslator:
     """Translator for n8n OpenAI nodes using Responses API."""
 
+    def __init__(self, options: GenerationOptions):
+        self.options = options
+
     def generate_node_function(self, node: N8nNode) -> str:
         prompt = escape_string(node.parameters.get("prompt", ""))
         system_prompt = escape_string(node.parameters.get("systemMessage", ""))
         template = """
 def {func_name}(state: WorkflowState) -> WorkflowState:
-    '''OpenAI node translated from n8n using Responses API with gpt-5.'''
+    '''OpenAI node translated from n8n using Responses API with configurable models and reflection.'''
     from langchain_core.runnables import RunnableLambda
 
     state.setdefault("data", [])
     state.setdefault("context", {})
 
-    llm_step = RunnableLambda(lambda user_prompt: call_llm(prompt=user_prompt, system="{system_prompt}" or None))
-    response_text = llm_step.invoke("{prompt}")
+    if ENABLE_AGENT:
+        response_text = agentic_llm(prompt="{prompt}", system="{system_prompt}" or None, state=state)
+    else:
+        llm_step = RunnableLambda(
+            lambda user_prompt: call_llm(
+                prompt=user_prompt,
+                system="{system_prompt}" or None,
+                model=DEFAULT_MODEL,
+                reflection=ENABLE_REFLECTION,
+                reflection_steps=REFLECTION_STEPS,
+            )
+        )
+        response_text = llm_step.invoke("{prompt}")
+
     state["data"].append({{"node": "{node_name}", "response": response_text}})
     state["context"]["openai_{node_id}"] = response_text
     state["last_node"] = "{node_name}"
@@ -265,13 +290,17 @@ def {func_name}(state: WorkflowState) -> WorkflowState:
         return False
 
 
-NODE_TRANSLATORS: Dict[str, NodeTranslator] = {
-    "n8n-nodes-base.set": SetNodeTranslator(),
-    "n8n-nodes-base.if": IfNodeTranslator(),
-    "n8n-nodes-base.httpRequest": HttpRequestTranslator(),
-    "n8n-nodes-base.code": CodeNodeTranslator(),
-    "n8n-nodes-base.openAi": OpenAiNodeTranslator(),
-}
+def get_translators(options: GenerationOptions) -> Dict[str, NodeTranslator]:
+    """Return node translators configured with generation options."""
+
+    return {
+        "n8n-nodes-base.set": SetNodeTranslator(),
+        "n8n-nodes-base.if": IfNodeTranslator(),
+        "n8n-nodes-base.httpRequest": HttpRequestTranslator(),
+        "n8n-nodes-base.code": CodeNodeTranslator(),
+        "n8n-nodes-base.openAi": OpenAiNodeTranslator(options),
+    }
+
 
 DEFAULT_TRANSLATOR = UnsupportedNodeTranslator()
 
@@ -355,11 +384,12 @@ def load_workflow(path: str) -> N8nWorkflow:
     return N8nWorkflow(nodes=nodes, edges=edges, start_nodes=start_nodes)
 
 
-def generate_node_function(node: N8nNode) -> Tuple[str, bool]:
+def generate_node_function(node: N8nNode, options: GenerationOptions) -> Tuple[str, bool]:
     """Generate Python code for a node function and return (code, uses_llm)."""
 
-    translator = NODE_TRANSLATORS.get(node.type, DEFAULT_TRANSLATOR)
-    if translator is DEFAULT_TRANSLATOR and node.type not in NODE_TRANSLATORS:
+    translators = get_translators(options)
+    translator = translators.get(node.type, DEFAULT_TRANSLATOR)
+    if translator is DEFAULT_TRANSLATOR and node.type not in translators:
         logger.warning("Unsupported node type '%s'. Generating stub node.", node.type)
     code = translator.generate_node_function(node)
     return code, translator.uses_llm(node)
@@ -403,7 +433,7 @@ def {func_name}(state: WorkflowState) -> str:
     return textwrap.dedent(code)
 
 
-def generate_python(workflow: N8nWorkflow) -> str:
+def generate_python(workflow: N8nWorkflow, options: GenerationOptions) -> str:
     """Generate the Python script implementing the workflow using LangGraph."""
 
     lines: List[str] = []
@@ -415,27 +445,60 @@ def generate_python(workflow: N8nWorkflow) -> str:
     append("from openai import OpenAI")
     append("from langgraph.graph import StateGraph")
     append("import os")
+    append("import textwrap")
     append("")
     append("class WorkflowState(TypedDict, total=False):")
     append("    data: List[Dict[str, Any]]")
     append("    context: Dict[str, Any]")
     append("    last_node: str")
     append("")
+    append(f"DEFAULT_MODEL = \"{escape_string(options.llm_model)}\"")
+    append(f"ENABLE_REFLECTION = {options.enable_reflection}")
+    append(f"REFLECTION_STEPS = {max(1, options.reflection_steps)}")
+    append(f"ENABLE_AGENT = {options.enable_agent}")
+    append("")
     append("client = OpenAI()")
     append("")
-    append("def call_llm(prompt: str, system: str | None = None) -> str:")
-    append("    \"\"\"Call OpenAI Responses API with model gpt-5.\"\"\"")
+    append("def _invoke_llm(messages: List[Dict[str, str]], model: str) -> str:")
+    append("    response = client.responses.create(model=model, input=messages)")
+    append("    choice = response.output[0]")
+    append("    return choice.content[0].text")
+    append("")
+    append("def call_llm(prompt: str, system: str | None = None, model: str = DEFAULT_MODEL, reflection: bool = False, reflection_steps: int = 1) -> str:")
+    append("    \"\"\"Call OpenAI Responses API with optional reflection loops.\"\"\"")
     append("    messages = []")
     append("    if system:\n        messages.append({\"role\": \"system\", \"content\": system})")
     append("    messages.append({\"role\": \"user\", \"content\": prompt})")
-    append("    response = client.responses.create(model=\"gpt-5\", input=messages)")
-    append("    choice = response.output[0]")
-    append("    return choice.content[0].text")
+    append("    draft = _invoke_llm(messages, model=model)")
+    append("    if not reflection:")
+    append("        return draft")
+    append("    critique = None")
+    append("    for _ in range(max(1, reflection_steps)):")
+    append("        critique_prompt = textwrap.dedent(f\"\"\"Review and, if needed, critique the following draft. Return only actionable suggestions.\nDraft:\n{draft}\"\"\")")
+    append("        critique_messages = []")
+    append("        if system:\n            critique_messages.append({\"role\": \"system\", \"content\": system})")
+    append("        critique_messages.append({\"role\": \"user\", \"content\": critique_prompt})")
+    append("        critique = _invoke_llm(critique_messages, model=model)")
+    append("        revision_prompt = textwrap.dedent(f\"\"\"Improve the previous draft using the critique. Return the revised answer directly.\nDraft:\n{draft}\nCritique:\n{critique}\"\"\")")
+    append("        revision_messages = []")
+    append("        if system:\n            revision_messages.append({\"role\": \"system\", \"content\": system})")
+    append("        revision_messages.append({\"role\": \"user\", \"content\": revision_prompt})")
+    append("        draft = _invoke_llm(revision_messages, model=model)")
+    append("    return draft")
+    append("")
+    append("def agentic_llm(prompt: str, system: str | None, state: WorkflowState) -> str:")
+    append("    \"\"\"Simple agent loop that reflects and uses context hints for reasoning.\"\"\"")
+    append("    context_hint = json.dumps(state.get(\"context\", {}), ensure_ascii=False)")
+    append("    enriched_prompt = textwrap.dedent(\"\"\"" "You are an agent solving a task with access to prior context.\n" "Context: {context}\nTask: {task}\"\"\").format(context=context_hint, task=prompt)")
+    append("    draft = call_llm(enriched_prompt, system=system, model=DEFAULT_MODEL, reflection=True, reflection_steps=max(1, REFLECTION_STEPS))")
+    append("    followup_prompt = textwrap.dedent(\"\"\"" "Re-evaluate the draft answer. If it is complete, return it verbatim. " "If it can be improved using context, return the improved version.\nDraft:\n{draft}\"\"\").format(draft=draft)")
+    append("    final_answer = call_llm(followup_prompt, system=system, model=DEFAULT_MODEL, reflection=False)")
+    append("    return final_answer")
     append("")
 
     sorted_nodes = sorted(workflow.nodes.values(), key=lambda n: n.name)
     for node in sorted_nodes:
-        func_code, _ = generate_node_function(node)
+        func_code, _ = generate_node_function(node, options)
         append(func_code)
 
     edges_by_source: Dict[str, List[N8nEdge]] = {}
@@ -503,6 +566,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--input", "-i", required=True, help="Path to n8n workflow JSON file")
     parser.add_argument("--output", "-o", required=True, help="Path to save generated Python script")
     parser.add_argument("--pretty", action="store_true", help="Format generated code with black if available")
+    parser.add_argument("--llm-model", default="gpt-5", help="Model name to embed in generated scripts (e.g., gpt-5.1-codex-max)")
+    parser.add_argument(
+        "--enable-reflection",
+        action="store_true",
+        help="Wrap LLM calls in a reflection loop inside generated scripts",
+    )
+    parser.add_argument(
+        "--reflection-steps",
+        type=int,
+        default=1,
+        help="Number of reflection iterations when enabled",
+    )
+    parser.add_argument(
+        "--enable-agent",
+        action="store_true",
+        help="Use the lightweight agentic LLM helper in generated OpenAI nodes",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args(argv)
 
@@ -515,12 +595,17 @@ def write_output(code: str, output_path: str) -> None:
     output_file.write_text(code, encoding="utf-8")
 
 
-def summarize(workflow: N8nWorkflow, output_path: str) -> None:
+def summarize(workflow: N8nWorkflow, output_path: str, options: GenerationOptions) -> None:
     """Print summary of conversion."""
 
     print(f"Converted {len(workflow.nodes)} nodes")
     print(f"Created {len(workflow.edges)} edges")
     print(f"Generated file: {output_path}")
+    print(f"LLM model: {options.llm_model}")
+    if options.enable_agent:
+        print("Agentic LLM: enabled")
+    if options.enable_reflection:
+        print(f"Reflection steps: {max(1, options.reflection_steps)}")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -541,8 +626,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         logger.error("Failed to load workflow: %s", exc)
         sys.exit(1)
 
+    options = GenerationOptions(
+        llm_model=args.llm_model,
+        enable_reflection=args.enable_reflection,
+        reflection_steps=args.reflection_steps,
+        enable_agent=args.enable_agent,
+    )
+
     try:
-        code = generate_python(workflow)
+        code = generate_python(workflow, options)
     except Exception as exc:
         logger.error("Failed to generate Python code: %s", exc)
         sys.exit(1)
@@ -552,7 +644,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.pretty:
         prettify_code(Path(args.output))
 
-    summarize(workflow, args.output)
+    summarize(workflow, args.output, options)
 
 
 if __name__ == "__main__":
