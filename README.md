@@ -6,7 +6,8 @@ A Python 3.11 CLI tool that converts n8n workflow JSON exports into standalone L
 - Normalizes n8n nodes, edges, and start nodes.
 - Pluggable node translators (Set, IF, HTTP Request, Code stub, OpenAI/LLM).
 - Generates LangGraph `StateGraph` code with routing for conditional branches.
-- All LLM calls use OpenAI Responses API with `gpt-5` via LangChain runnables.
+- All LLM calls use OpenAI Responses API with configurable models (defaults to `gpt-5` and can be set to `gpt-5.1-codex-max`) via LangChain runnables.
+- Optional reflection and lightweight agentic loop for OpenAI nodes in generated workflows.
 - Optional code formatting via `black` when installed.
 
 ## Quickstart
@@ -25,6 +26,11 @@ A Python 3.11 CLI tool that converts n8n workflow JSON exports into standalone L
 - Python 3.11+
 - `openai`, `langgraph`, `langchain-core`, `requests` (runtime for generated script)
 - `black` (optional, for formatting)
+
+## Advanced options
+- `--llm-model`: override the model used in generated scripts (e.g., `gpt-5.1-codex-max`).
+- `--enable-reflection` and `--reflection-steps`: wrap generated LLM calls in a reflection loop for self-critique.
+- `--enable-agent`: toggle a lightweight agentic helper that re-prompts the LLM with state context when translating OpenAI nodes.
 
 ## Notes
 - Unsupported n8n nodes produce stub functions that raise `NotImplementedError`.
