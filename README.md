@@ -34,6 +34,30 @@ A Python 3.11 CLI tool that converts n8n workflow JSON exports into standalone L
 - `--enable-agent`: toggle a lightweight agentic helper that re-prompts the LLM with state context when translating OpenAI nodes.
 - `--enable-llm-assist` and `--llm-assist-model`: use the converter's LLM helper to infer code for unsupported nodes and rewrite prompts for clarity.
 
+## Conversion flow
+
+```mermaid
+flowchart TD
+    A[Start: n8n workflow JSON] --> B[Parse nodes and edges]
+    B --> C[Normalize graph structure
+        - start nodes
+        - node metadata
+        - edge routing]
+    C --> D[Translate nodes via pluggable translators
+        - Set / IF / HTTP Request / Code stubs
+        - OpenAI & LLM nodes]
+    D --> E[Apply optional helpers
+        - Reflection loop
+        - Agentic re-prompting
+        - LLM assist for unsupported nodes]
+    E --> F[Generate LangGraph StateGraph code
+        - state schema
+        - routes for branches
+        - OpenAI Responses API calls]
+    F --> G[Format output (optional: black)]
+    G --> H[Emit runnable Python script]
+```
+
 ## Notes
 - Unsupported n8n nodes produce stub functions that raise `NotImplementedError`.
 - Code nodes are preserved as comments for manual review.
